@@ -8,6 +8,10 @@ from typing import Optional, Dict, Any
 import requests
 import yt_dlp
 
+from backend.parsers.deezer_parser import resolve_deezer_track
+from backend.parsers.soundcloud_parser import resolve_soundcloud_track, is_soundcloud_url
+from backend.parsers.bandcamp_parser import fetch_bandcamp_metadata, is_bandcamp_url
+
 logger = logging.getLogger("metadata")
 
 SPOTIFY_TRACK_REGEX = re.compile(
@@ -172,5 +176,31 @@ def resolve_metadata(query: str) -> Dict[str, Any]:
         except Exception:
             pass
         return spotify_meta
+    elif "deezer.com" in query_str:
+        deezer_meta = resolve_deezer_track(query_str)
+        try:
+            yt_aug = resolve_youtube_query(deezer_meta["search_query"])
+            deezer_meta["source_url"] = yt_aug.get("source_url", query_str)
+        except Exception:
+            pass
+        return deezer_meta
+    elif is_soundcloud_url(query_str):
+        return resolve_soundcloud_track(query_str)
+    elif is_bandcamp_url(query_str):
+        bc_data = fetch_bandcamp_metadata(query_str)
+        first_track = bc_data["tracks"][0]
+        return {
+            "title": first_track["title"],
+            "artist": first_track["artist"],
+            "artists_display": first_track["artist"],
+            "album": bc_data["title"],
+            "year": "",
+            "cover_url": bc_data["cover_art"],
+            "duration_str": first_track["duration_formatted"],
+            "duration_sec": first_track["duration_ms"] // 1000,
+            "search_query": first_track["source_url"],
+            "source": "bandcamp",
+            "source_url": first_track["source_url"],
+        }
     else:
         return resolve_youtube_query(query_str)

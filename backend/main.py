@@ -7,7 +7,7 @@ import shutil
 import logging
 from typing import Optional, Dict, Any, List
 from urllib.parse import quote
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, HTTPException, Query, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -20,11 +20,15 @@ if BASE_DIR not in sys.path:
 
 from backend.services.metadata import resolve_metadata
 from backend.services.downloader import download_single_track
-from backend.services.streamer import proxy_audio_stream
+from backend.services.streamer import proxy_audio_stream, stream_audio_chunks
 from backend.services.cleanup import cleanup_temp_dir
 from backend.services.lyrics_service import fetch_lyrics
 from backend.parsers.spotify_parser import fetch_spotify_metadata
 from backend.parsers.apple_parser import fetch_apple_metadata
+from backend.parsers.deezer_parser import fetch_deezer_metadata
+from backend.parsers.soundcloud_parser import fetch_soundcloud_metadata, is_soundcloud_url
+from backend.parsers.yt_playlist_parser import fetch_yt_playlist_metadata, is_yt_playlist_url
+from backend.parsers.bandcamp_parser import fetch_bandcamp_metadata, is_bandcamp_url
 from backend.services.task_manager import TaskManager
 
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
@@ -133,16 +137,18 @@ def download_single(req: SingleDownloadRequest, background_tasks: BackgroundTask
 
 
 @app.get("/api/stream")
-def stream_audio(url: str = Query(..., description="YouTube or direct track URL")):
-    """Proxies progressive audio stream for instant in-browser preview."""
+def stream_audio(request: Request, url: str = Query(..., description="YouTube or direct track URL")):
+    """Proxies progressive audio stream with Range header support for seeking and preview."""
     try:
+        range_header = request.headers.get("range")
+        status_code, headers, generator = stream_audio_chunks(url, range_header)
         return StreamingResponse(
-            proxy_audio_stream(url),
-            media_type="audio/webm",
-            headers={"Accept-Ranges": "bytes"},
+            generator,
+            status_code=status_code,
+            headers=headers,
         )
     except Exception as e:
-        logger.error(f"Stream proxy error: {e}")
+        logger.error(f"Stream proxy error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -162,10 +168,18 @@ async def parse_playlist(req: PlaylistParseRequest):
             metadata = fetch_spotify_metadata(url)
         elif "apple.com" in url:
             metadata = fetch_apple_metadata(url)
+        elif "deezer.com" in url:
+            metadata = fetch_deezer_metadata(url)
+        elif is_soundcloud_url(url):
+            metadata = fetch_soundcloud_metadata(url)
+        elif is_yt_playlist_url(url):
+            metadata = fetch_yt_playlist_metadata(url)
+        elif is_bandcamp_url(url):
+            metadata = fetch_bandcamp_metadata(url)
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Unsupported playlist link. Please enter a valid Spotify or Apple Music URL."
+                detail="Unsupported link. Supported providers: Spotify, Apple Music, Deezer, SoundCloud, YouTube, and Bandcamp."
             )
 
         session_id = task_manager.create_session(metadata)

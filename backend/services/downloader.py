@@ -37,13 +37,20 @@ def download_single_track(
     os.makedirs(job_dir, exist_ok=True)
 
     clean_bitrate = bitrate.replace("k", "")
-    target_url = meta.get("source_url") or meta.get("search_query")
-    if not target_url.startswith("http"):
-        target_url = f"ytsearch1:{target_url}"
+    source_lower = str(meta.get("source_url") or "").lower()
+    if any(drm in source_lower for drm in ["deezer.com", "spotify.com", "apple.com"]) or not source_lower.startswith("http"):
+        target_url = f"ytsearch1:{meta.get('search_query') or meta.get('title')}"
+    else:
+        target_url = meta.get("source_url") or f"ytsearch1:{meta.get('search_query') or meta.get('title')}"
 
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(job_dir, "raw_audio.%(ext)s"),
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "tv_embedded"]
+            }
+        },
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -56,8 +63,14 @@ def download_single_track(
         "noplaylist": True,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([target_url])
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([target_url])
+    except Exception as yt_dl_err:
+        logger.warning(f"YouTube single download failed ({yt_dl_err}), falling back to SoundCloud...")
+        sc_target = f"scsearch1:{meta.get('search_query') or meta.get('title')}"
+        with yt_dlp.YoutubeDL(ydl_opts) as sc_ydl:
+            sc_ydl.download([sc_target])
 
     expected_mp3 = os.path.join(job_dir, "raw_audio.mp3")
     if not os.path.exists(expected_mp3):
@@ -157,6 +170,11 @@ def download_playlist_track(
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "tv_embedded"]
+            }
+        },
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -176,7 +194,17 @@ def download_playlist_track(
     best_video_id = None
     best_diff = 999999
 
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True}) as ydl:
+    search_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "tv_embedded"]
+            }
+        },
+    }
+    with yt_dlp.YoutubeDL(search_opts) as ydl:
         try:
             results = ydl.extract_info(search_query, download=False)
             entries = results.get("entries", []) if results else []
@@ -207,22 +235,46 @@ def download_playlist_track(
         except Exception as e:
             logger.error(f"Search error: {e}")
 
-    if not best_video_id:
-        raise RuntimeError(f"Could not find audio for '{artist} - {title}' on YouTube.")
+    target_url = None
+    target_identifier = None
+    if best_video_id:
+        target_url = f"https://www.youtube.com/watch?v={best_video_id}"
+        target_identifier = str(best_video_id)
+    else:
+        # Waterfall Provider 2 Fallback: SoundCloud
+        try:
+            logger.info(f"Cascading to SoundCloud search for '{artist} - {clean_title}'...")
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True}) as sc_ydl:
+                sc_res = sc_ydl.extract_info(f"scsearch3:{artist} - {clean_title}", download=False)
+                sc_entries = sc_res.get("entries", []) if sc_res else []
+                if sc_entries and sc_entries[0]:
+                    target_url = sc_entries[0].get("webpage_url") or sc_entries[0].get("url")
+                    target_identifier = str(sc_entries[0].get("id") or "sc_track")
+                    logger.info(f"SoundCloud matched: {sc_entries[0].get('title')}")
+        except Exception as sc_err:
+            logger.warning(f"SoundCloud fallback search error: {sc_err}")
 
-    target_url = f"https://www.youtube.com/watch?v={best_video_id}"
+    if not target_url:
+        raise RuntimeError(f"Could not find audio for '{artist} - {title}' across YouTube or SoundCloud.")
+
+    existing_before = set(os.listdir(output_dir))
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([target_url])
 
-    expected_mp3 = os.path.join(output_dir, f"{best_video_id}.mp3")
-    if not os.path.exists(expected_mp3):
+    new_files = [f for f in os.listdir(output_dir) if f not in existing_before and f.endswith(".mp3")]
+    expected_mp3 = None
+    if new_files:
+        expected_mp3 = os.path.join(output_dir, new_files[0])
+    elif target_identifier and os.path.exists(os.path.join(output_dir, f"{target_identifier}.mp3")):
+        expected_mp3 = os.path.join(output_dir, f"{target_identifier}.mp3")
+    else:
         for f in os.listdir(output_dir):
-            if f.startswith(best_video_id) and f.endswith(".mp3"):
+            if f.endswith(".mp3"):
                 expected_mp3 = os.path.join(output_dir, f)
                 break
 
-    if not os.path.exists(expected_mp3):
-        raise RuntimeError(f"MP3 file not generated for video ID {best_video_id}")
+    if not expected_mp3 or not os.path.exists(expected_mp3):
+        raise RuntimeError(f"MP3 file not generated for '{artist} - {title}'")
 
     safe_artist = sanitize_filename(artist)
     safe_title = sanitize_filename(title)
